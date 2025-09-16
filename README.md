@@ -1,3 +1,27 @@
+## 🔥 Notice: This is a fork of livekit/agents adapted for FireRedChat
+
+```bash
+# install fireredchat plugins
+cd agents/fireredchat-plugins
+pip install -e livekit-plugins-firered
+pip install -e livekit-plugins-fireredchat-pvad
+pip install -e livekit-plugins-fireredchat-turn-detector
+
+# install other plugins (if needed)
+pip install "livekit-agents[openai,silero,deepgram,cartesia,turn-detector]~=1.0"
+
+# download models
+cd agents/examples
+python3 fireredchat_worker.py download-files
+
+# run agent
+cd agents/examples
+cp .env.dev .env
+python3 fireredchat_worker.py dev
+```
+
+Original README goes below:
+
 <!--BEGIN_BANNER_IMAGE-->
 
 <picture>

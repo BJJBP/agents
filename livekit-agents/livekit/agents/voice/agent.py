@@ -395,7 +395,8 @@ class Agent:
             if not activity.tts.capabilities.streaming:
                 wrapped_tts = tts.StreamAdapter(
                     tts=wrapped_tts,
-                    sentence_tokenizer=tokenize.blingfire.SentenceTokenizer(retain_format=True),
+                    sentence_tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=16, retain_format=True),
+                    # sentence_tokenizer=tokenize.blingfire.SentenceTokenizer(retain_format=True),
                 )
 
             conn_options = activity.session.conn_options.tts_conn_options

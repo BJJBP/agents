@@ -1,0 +1,9 @@
+[submodule "fireredchat-plugins/livekit-plugins-fireredchat-turn-detector"]
+	path = fireredchat-plugins/livekit-plugins-fireredchat-turn-detector
+	url = https://github.com/FireRedTeam/livekit-plugins-fireredchat-turn-detector.git
+[submodule "fireredchat-plugins/livekit-plugins-firered"]
+	path = fireredchat-plugins/livekit-plugins-firered
+	url = https://github.com/FireRedTeam/livekit-plugins-firered.git
+[submodule "fireredchat-plugins/livekit-plugins-fireredchat-pvad"]
+	path = fireredchat-plugins/livekit-plugins-fireredchat-pvad
+	url = https://github.com/FireRedTeam/livekit-plugins-fireredchat-pvad.git

@@ -150,6 +150,9 @@ class VADStream(ABC):
         self.flush()
         self._input_ch.close()
 
+    def update_speaker(self, frame: rtc.AudioFrame) -> None:
+        pass
+
     async def aclose(self) -> None:
         """Close the stream immediately"""
         self._input_ch.close()

@@ -17,6 +17,8 @@ def split_sentences(
     digits = r"([0-9])"
     multiple_dots = r"\.{2,}"
 
+    # force on
+    retain_format = True
     # fmt: off
     if retain_format:
         text = text.replace("\n","<nel><stop>")
@@ -32,6 +34,8 @@ def split_sentences(
     text = re.sub(multiple_dots, lambda match: "<prd>" * len(match.group(0)), text)
     if "Ph.D" in text:
         text = text.replace("Ph.D.","Ph<prd>D<prd>")
+    
+    text = re.sub(r"\s\s" + digits + "[.] ","<stop>\\1<prd> ",text)
     text = re.sub(r"\s" + alphabets + "[.] "," \\1<prd> ",text)
     text = re.sub(acronyms+" "+starters,"\\1<stop> \\2",text)
     text = re.sub(alphabets + "[.]" + alphabets + "[.]" + alphabets + "[.]","\\1<prd>\\2<prd>\\3<prd>",text)  # noqa: E501
@@ -41,14 +45,14 @@ def split_sentences(
     text = re.sub(r" " + alphabets + "[.]"," \\1<prd>",text)
 
     # mark end of sentence punctuations with <stop>
-    text = re.sub(r"([.!?。！？])([\"”])", "\\1\\2<stop>", text)
-    text = re.sub(r"([.!?。！？])(?![\"”])", "\\1<stop>", text)
+    text = re.sub(r"([.!?；。！？])([\"”])", "\\1\\2<stop>", text)
+    text = re.sub(r"([.!?；。！？])(?![\"”])", "\\1<stop>", text)
 
     text = text.replace("<prd>",".")
     # fmt: on
 
     if retain_format:
-        text = text.replace("<nel>", "\n")
+        text = text.replace("<nel>", " ")
     splitted_sentences = text.split("<stop>")
     text = text.replace("<stop>", "")
 

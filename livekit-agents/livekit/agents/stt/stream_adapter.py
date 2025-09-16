@@ -6,7 +6,7 @@ from typing import Any
 
 from .. import utils
 from ..types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, APIConnectOptions, NotGivenOr
-from ..vad import VAD, VADEventType
+from ..vad import VAD, VADEvent, VADEventType
 from .stt import STT, RecognizeStream, SpeechEvent, SpeechEventType, STTCapabilities
 
 # already a retry mechanism in STT.recognize, don't retry in stream adapter
@@ -96,6 +96,9 @@ class StreamAdapterWrapper(RecognizeStream):
         async def _recognize() -> None:
             """recognize speech from vad"""
             async for event in vad_stream:
+                if isinstance(event, VADEvent):
+                    self._event_ch.send_nowait(event)
+
                 if event.type == VADEventType.START_OF_SPEECH:
                     self._event_ch.send_nowait(SpeechEvent(SpeechEventType.START_OF_SPEECH))
                 elif event.type == VADEventType.END_OF_SPEECH:
@@ -123,6 +126,7 @@ class StreamAdapterWrapper(RecognizeStream):
                             alternatives=[t_event.alternatives[0]],
                         )
                     )
+                    vad_stream.update_speaker(merged_frames)
 
         tasks = [
             asyncio.create_task(_forward_input(), name="forward_input"),

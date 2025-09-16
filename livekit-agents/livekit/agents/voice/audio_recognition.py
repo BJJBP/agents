@@ -119,11 +119,11 @@ class AudioRecognition:
 
     def start(self) -> None:
         self.update_stt(self._stt)
-        self.update_vad(self._vad)
+        # self.update_vad(self._vad)
 
     def stop(self) -> None:
         self.update_stt(None)
-        self.update_vad(None)
+        # self.update_vad(None)
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         self._sample_rate = frame.sample_rate
@@ -238,6 +238,12 @@ class AudioRecognition:
         if self._audio_interim_transcript:
             return self._audio_transcript + " " + self._audio_interim_transcript
         return self._audio_transcript
+
+    async def _on_stt_vad_event(self, ev: stt.SpeechEvent | vad.VADEvent) -> None:
+        if type(ev) == vad.VADEvent:
+            await self._on_vad_event(ev)
+        elif type(ev) == stt.SpeechEvent:
+            await self._on_stt_event(ev)
 
     async def _on_stt_event(self, ev: stt.SpeechEvent) -> None:
         if (
@@ -472,10 +478,13 @@ class AudioRecognition:
 
         if isinstance(node, AsyncIterable):
             async for ev in node:
-                assert isinstance(ev, stt.SpeechEvent), (
-                    f"STT node must yield SpeechEvent, got: {type(ev)}"
+                assert isinstance(ev, (stt.SpeechEvent, vad.VADEvent)), (
+                    f"STT node must yield SpeechEvent or VADEvent, got: {type(ev)}"
                 )
-                await self._on_stt_event(ev)
+                # await self._on_stt_event(ev)
+                
+                # instead of calling two vads, reuse this vad result
+                await self._on_stt_vad_event(ev)
 
     @utils.log_exceptions(logger=logger)
     async def _vad_task(
