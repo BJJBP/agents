@@ -83,22 +83,22 @@ async def entrypoint(ctx: JobContext):
 
     instruction = character.get(name, character["nana"])
     used_agent = MyAgent(instruction)
-    used_llm = openai.LLM(model="qwen2.5-14b",
-                    api_key="notneeded",
-                    base_url="http://your_ollama_api"
-                    )
+    used_llm = openai.LLM.with_ollama(
+        model="qwen2.5-7b",
+        base_url="http://localhost:11434/v1", # your ollama base api base url
+    )
 
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
         # any combination of STT, LLM, TTS, or realtime API can be used
         llm=used_llm,
         stt=firered.STT(model="FireRedASR-AED-1",
-                       base_url="http://your_hosted_asr_server/fireredasr",
+                       base_url="http://localhost:8000", # your asr base api base url
                        api_key="notneeded"),
         tts=firered.TTS(
             model="fireredtts1.0",
             voice=voice,
-            base_url="http://your_hosted_tts_server/fireredtts1",
+            base_url="http://localhost:8081/v1", # your tts base api base url
             api_key="notneeded",
             response_format="mp3"
             ),

@@ -1,6 +1,10 @@
 ## 🔥 Notice: This is a fork of livekit/agents adapted for FireRedChat
 
 ```bash
+# install this fork
+cd agents
+pip install -e .
+
 # install fireredchat plugins
 cd agents/fireredchat-plugins
 pip install -e livekit-plugins-firered
@@ -14,9 +18,15 @@ pip install "livekit-agents[openai,silero,deepgram,cartesia,turn-detector]~=1.0"
 cd agents/examples
 python3 fireredchat_worker.py download-files
 
-# run agent
+# run agent with dev keys
 cd agents/examples
 cp .env.dev .env
+
+# edit fireredchat_worker.py
+# change base_url to your hosted asr, llm, tts address
+# you could use ollama (https://ollama.com/) for the simplest setup 
+
+# run agent
 python3 fireredchat_worker.py dev
 ```
 
