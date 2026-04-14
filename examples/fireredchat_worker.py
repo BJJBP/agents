@@ -84,7 +84,7 @@ async def entrypoint(ctx: JobContext):
     instruction = character.get(name, character["nana"])
     used_agent = MyAgent(instruction)
     used_llm = openai.LLM.with_ollama(
-        model="qwen2.5-7b",
+        model="Qwen2.5-Omni-3B",
         base_url="http://localhost:11434/v1", # your ollama base api base url
     )
 
@@ -112,7 +112,7 @@ async def entrypoint(ctx: JobContext):
         current_date = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # This example writes to the temporary directory, but you can save to any location
-        filename = f"/workspace/logs/transcript_{ctx.room.name}_{current_date}.json"
+        filename = f"/NAS/projects/FireRedChat/logs/transcript_{ctx.room.name}_{current_date}.json"
         
         with open(filename, 'w+') as f:
             json.dump(session.history.to_dict(), f, indent=4, ensure_ascii=False)
@@ -148,4 +148,11 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm, job_memory_warn_mb=1500))
+    cli.run_app(
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
+            job_memory_warn_mb=1500,
+            initialize_process_timeout=45.0,
+        )
+    )
