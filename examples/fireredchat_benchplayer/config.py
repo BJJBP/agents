@@ -22,6 +22,10 @@ class BenchConfig:
     frame_ms: int = 10
     runtime_log_dir: Path = DEFAULT_RUNTIME_LOG_DIR
     transcript_root: Path = DEFAULT_TRANSCRIPT_ROOT
+    profiling_enabled: bool = True
+    profiling_log_root: Path = Path("/NAS/projects/FireRedChat/logs/profiling")
+    bench_metrics_port: int = 9102
+    scheduler_endpoint: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "root_dir", self.root_dir.expanduser().resolve())
@@ -30,6 +34,9 @@ class BenchConfig:
         )
         object.__setattr__(
             self, "transcript_root", self.transcript_root.expanduser().resolve()
+        )
+        object.__setattr__(
+            self, "profiling_log_root", self.profiling_log_root.expanduser().resolve()
         )
 
         if self.case_timeout_s <= 0:
@@ -42,6 +49,8 @@ class BenchConfig:
             raise ValueError("bench audio config must be positive")
         if self.frame_ms <= 0:
             raise ValueError("bench frame size must be positive")
+        if self.bench_metrics_port <= 0:
+            raise ValueError("bench metrics port must be positive")
 
     @property
     def frame_samples(self) -> int:

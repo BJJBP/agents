@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 import aiohttp.web_request
 from aiohttp import web
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
+    CollectorRegistry,
     generate_latest,
+    multiprocess,
 )
 
 from .. import utils
@@ -14,8 +17,11 @@ from .. import utils
 
 async def metrics(_request: aiohttp.web_request.Request) -> web.Response:
     def _get_metrics() -> bytes:
-        # registry = CollectorRegistry(auto_describe=True)
-        # multiprocess.MultiProcessCollector(registry)
+        multiproc_dir = os.getenv("PROMETHEUS_MULTIPROC_DIR")
+        if multiproc_dir:
+            registry = CollectorRegistry()
+            multiprocess.MultiProcessCollector(registry)
+            return generate_latest(registry)
         return generate_latest()
 
     loop = asyncio.get_running_loop()

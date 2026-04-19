@@ -15,6 +15,9 @@ from livekit import rtc
 from livekit.agents.llm.realtime import MessageGeneration
 
 from .. import llm, stt, tts, utils, vad
+from ..profiling.clock import now_mono_ns, now_wall_time_ns
+from ..profiling.context import TraceContext
+from ..profiling.ids import ProfilingIdGenerator
 from ..llm.tool_context import StopResponse
 from ..log import logger
 from ..metrics import (
@@ -202,6 +205,8 @@ class AgentActivity(RecognitionHooks):
 
         # speeches that audio playout finished but not done because of tool calls
         self._background_speeches: set[SpeechHandle] = set()
+        self._speech_trace_contexts: dict[str, TraceContext] = {}
+        self._barge_in_start_by_speech_id: dict[str, tuple[int, int]] = {}
 
     @property
     def scheduling_paused(self) -> bool:
@@ -231,6 +236,89 @@ class AgentActivity(RecognitionHooks):
             if is_given(self._agent.mcp_servers)
             else self._session.mcp_servers
         )
+
+    def _profiling_userdata(self) -> dict[str, Any] | None:
+        try:
+            userdata = self._session.userdata
+        except ValueError:
+            return None
+        return userdata if isinstance(userdata, dict) else None
+
+    def _profiling_runtime(self) -> Any | None:
+        userdata = self._profiling_userdata()
+        return userdata.get("profiling_runtime") if userdata else None
+
+    def _profiling_turn_tracker(self) -> Any | None:
+        userdata = self._profiling_userdata()
+        return userdata.get("profiling_turn_tracker") if userdata else None
+
+    def _profiling_generation_step_tracker(self) -> Any | None:
+        userdata = self._profiling_userdata()
+        return userdata.get("profiling_generation_step_tracker") if userdata else None
+
+    def _profiling_output_observer(self) -> Any | None:
+        userdata = self._profiling_userdata()
+        return userdata.get("profiling_output_observer") if userdata else None
+
+    def _profiling_tts_scheduler_client(self) -> Any | None:
+        userdata = self._profiling_userdata()
+        return userdata.get("profiling_tts_scheduler_client") if userdata else None
+
+    def _base_trace_context(self) -> TraceContext | None:
+        userdata = self._profiling_userdata()
+        base_ctx = userdata.get("profiling_base_context") if userdata else None
+        return base_ctx if isinstance(base_ctx, TraceContext) else None
+
+    def _new_response_trace_context(self, response_id: str) -> TraceContext | None:
+        turn_tracker = self._profiling_turn_tracker()
+        if turn_tracker is not None:
+            return turn_tracker.start_response(response_id=response_id)
+
+        base_ctx = self._base_trace_context()
+        if base_ctx is None:
+            return None
+
+        return base_ctx.with_updates(
+            response_id=response_id,
+            attempt_id=ProfilingIdGenerator.attempt_id(),
+        )
+
+    def _on_speech_done_for_profiling(self, handle: SpeechHandle) -> None:
+        trace_ctx = self._speech_trace_contexts.pop(handle.id, None)
+        if trace_ctx is None:
+            return
+
+        observer = self._profiling_output_observer()
+        if observer is not None:
+            observer.on_response_terminal(trace_ctx=trace_ctx, interrupted=handle.interrupted)
+
+        runtime = self._profiling_runtime()
+        barge_in_start = self._barge_in_start_by_speech_id.pop(handle.id, None)
+        if runtime is not None and barge_in_start is not None and handle.interrupted:
+            runtime.emit_logical_span(
+                "barge_in_cut",
+                start_mono_ns=barge_in_start[0],
+                end_mono_ns=now_mono_ns(),
+                start_wall_time_ns=barge_in_start[1],
+                end_wall_time_ns=now_wall_time_ns(),
+                trace_ctx=trace_ctx,
+            )
+        scheduler_client = self._profiling_tts_scheduler_client()
+        if (
+            handle.interrupted
+            and scheduler_client is not None
+            and getattr(scheduler_client, "enabled", False)
+        ):
+            asyncio.create_task(
+                scheduler_client.cancel_response(trace_ctx.response_id, trace_ctx.attempt_id)
+            )
+
+        turn_tracker = self._profiling_turn_tracker()
+        if turn_tracker is not None:
+            turn_tracker.finish_trace(
+                status="interrupted" if handle.interrupted else "ok",
+                trace_ctx=trace_ctx,
+            )
 
     @property
     def allow_interruptions(self) -> bool:
@@ -675,7 +763,7 @@ class AgentActivity(RecognitionHooks):
 
             self._agent._activity = None
 
-    def push_audio(self, frame: rtc.AudioFrame) -> None:
+    def push_audio(self, frame: rtc.AudioFrame, *, source: str = "raw_user_audio") -> None:
         if not self._started:
             return
 
@@ -687,11 +775,16 @@ class AgentActivity(RecognitionHooks):
             # discard the audio if the current speech is not interruptable
             return
 
+        if source == "raw_user_audio":
+            turn_tracker = self._profiling_turn_tracker()
+            if turn_tracker is not None:
+                turn_tracker.on_raw_user_audio_frame()
+
         if self._rt_session is not None:
             self._rt_session.push_audio(frame)
 
         if self._audio_recognition is not None:
-            self._audio_recognition.push_audio(frame)
+            self._audio_recognition.push_audio(frame, source=source)
 
     def push_video(self, frame: rtc.VideoFrame) -> None:
         if not self._started:
@@ -732,6 +825,13 @@ class AgentActivity(RecognitionHooks):
             if is_given(allow_interruptions)
             else self.allow_interruptions
         )
+        trace_ctx = self._new_response_trace_context(handle.id)
+        if trace_ctx is not None:
+            self._speech_trace_contexts[handle.id] = trace_ctx
+            handle.add_done_callback(self._on_speech_done_for_profiling)
+            runtime = self._profiling_runtime()
+            if runtime is not None:
+                runtime.emit_event("speech_created", trace_ctx=trace_ctx, attrs={"source": "say"})
         self._session.emit(
             "speech_created",
             SpeechCreatedEvent(speech_handle=handle, user_initiated=True, source="say"),
@@ -788,6 +888,17 @@ class AgentActivity(RecognitionHooks):
             if is_given(allow_interruptions)
             else self.allow_interruptions,
         )
+        trace_ctx = self._new_response_trace_context(handle.id)
+        if trace_ctx is not None:
+            self._speech_trace_contexts[handle.id] = trace_ctx
+            handle.add_done_callback(self._on_speech_done_for_profiling)
+            runtime = self._profiling_runtime()
+            if runtime is not None:
+                runtime.emit_event(
+                    "speech_created",
+                    trace_ctx=trace_ctx,
+                    attrs={"source": "generate_reply"},
+                )
         self._session.emit(
             "speech_created",
             SpeechCreatedEvent(speech_handle=handle, user_initiated=True, source="generate_reply"),
@@ -1071,6 +1182,12 @@ class AgentActivity(RecognitionHooks):
     def _interrupt_by_audio_activity(self) -> None:
         opt = self._session.options
         use_pause = opt.resume_false_interruption and opt.false_interruption_timeout is not None
+        runtime = self._profiling_runtime()
+        trace_ctx = (
+            self._speech_trace_contexts.get(self._current_speech.id)
+            if self._current_speech is not None
+            else None
+        )
 
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.turn_detection:
             # ignore if realtime model has turn detection enabled
@@ -1095,6 +1212,19 @@ class AgentActivity(RecognitionHooks):
             and not self._current_speech.interrupted
             and self._current_speech.allow_interruptions
         ):
+            if runtime is not None and trace_ctx is not None:
+                barge_in_mono_ns = now_mono_ns()
+                barge_in_wall_time_ns = now_wall_time_ns()
+                runtime.emit_event(
+                    "barge_in_detected",
+                    trace_ctx=trace_ctx,
+                    mono_ns=barge_in_mono_ns,
+                    wall_time_ns=barge_in_wall_time_ns,
+                )
+                self._barge_in_start_by_speech_id[self._current_speech.id] = (
+                    barge_in_mono_ns,
+                    barge_in_wall_time_ns,
+                )
             self._paused_speech = self._current_speech
 
             # reset the false interruption timer
@@ -1113,6 +1243,9 @@ class AgentActivity(RecognitionHooks):
     # region recognition hooks
 
     def on_start_of_speech(self, ev: vad.VADEvent) -> None:
+        turn_tracker = self._profiling_turn_tracker()
+        if turn_tracker is not None:
+            turn_tracker.on_vad_start(attrs={"speech_duration": ev.speech_duration})
         self._session._update_user_state("speaking")
 
         if self._false_interruption_timer:
@@ -1121,6 +1254,9 @@ class AgentActivity(RecognitionHooks):
             self._false_interruption_timer = None
 
     def on_end_of_speech(self, ev: vad.VADEvent) -> None:
+        turn_tracker = self._profiling_turn_tracker()
+        if turn_tracker is not None:
+            turn_tracker.on_vad_end(attrs={"silence_duration": ev.silence_duration})
         self._session._update_user_state(
             "listening",
             last_speaking_time=time.time() - ev.silence_duration,
@@ -1207,6 +1343,11 @@ class AgentActivity(RecognitionHooks):
     def on_end_of_turn(self, info: _EndOfTurnInfo) -> bool:
         # IMPORTANT: This method is sync to avoid it being cancelled by the AudioRecognition
         # We explicitly create a new task here
+        turn_tracker = self._profiling_turn_tracker()
+        if turn_tracker is not None:
+            turn_tracker.on_end_of_turn_committed(
+                attrs={"transcript": info.new_transcript},
+            )
 
         if self._scheduling_paused:
             self._cancel_preemptive_generation()
@@ -1356,6 +1497,26 @@ class AgentActivity(RecognitionHooks):
                 user_message=user_message, chat_ctx=temp_mutable_chat_ctx
             )
 
+        runtime = self._profiling_runtime()
+        trace_ctx = self._speech_trace_contexts.get(speech_handle.id)
+        if runtime is not None and trace_ctx is not None:
+            response_started_mono_ns = now_mono_ns()
+            response_started_wall_time_ns = now_wall_time_ns()
+            runtime.emit_event(
+                "response_attempt_started",
+                trace_ctx=trace_ctx,
+                mono_ns=response_started_mono_ns,
+                wall_time_ns=response_started_wall_time_ns,
+                attrs={"source": "user_turn_completed"},
+            )
+            observer = self._profiling_output_observer()
+            if observer is not None:
+                observer.on_response_started(
+                    trace_ctx=trace_ctx,
+                    mono_ns=response_started_mono_ns,
+                    wall_time_ns=response_started_wall_time_ns,
+                )
+
         if self._user_turn_completed_atask != asyncio.current_task():
             # If a new user turn has already started, interrupt this one since it's now outdated
             # (We still create the SpeechHandle and the generate_reply coroutine, otherwise we may
@@ -1409,6 +1570,15 @@ class AgentActivity(RecognitionHooks):
 
         text_source: AsyncIterable[str] | None = None
         audio_source: AsyncIterable[str] | None = None
+        runtime = self._profiling_runtime()
+        response_ctx = self._speech_trace_contexts.get(speech_handle.id)
+        step_tracker = self._profiling_generation_step_tracker()
+        step_ctx = (
+            step_tracker.next_context(response_ctx)
+            if response_ctx is not None and step_tracker is not None
+            else response_ctx
+        )
+        output_observer = self._profiling_output_observer()
 
         tee: utils.aio.itertools.Tee[str] | None = None
         if isinstance(text, AsyncIterable):
@@ -1435,6 +1605,8 @@ class AgentActivity(RecognitionHooks):
                     node=self._agent.tts_node,
                     input=audio_source,
                     model_settings=model_settings,
+                    runtime=runtime,
+                    trace_ctx=step_ctx,
                 )
                 tasks.append(tts_task)
                 if (
@@ -1446,13 +1618,17 @@ class AgentActivity(RecognitionHooks):
                     text_source = timed_texts
 
                 forward_task, audio_out = perform_audio_forwarding(
-                    audio_output=audio_output, tts_output=tts_gen_data.audio_ch
+                    audio_output=audio_output,
+                    tts_output=tts_gen_data.audio_ch,
+                    observer=output_observer,
                 )
                 tasks.append(forward_task)
             else:
                 # use the provided audio
                 forward_task, audio_out = perform_audio_forwarding(
-                    audio_output=audio_output, tts_output=audio
+                    audio_output=audio_output,
+                    tts_output=audio,
+                    observer=output_observer,
                 )
                 tasks.append(forward_task)
 
@@ -1540,6 +1716,15 @@ class AgentActivity(RecognitionHooks):
             if self._session.output.transcription_enabled
             else None
         )
+        runtime = self._profiling_runtime()
+        response_ctx = self._speech_trace_contexts.get(speech_handle.id)
+        step_tracker = self._profiling_generation_step_tracker()
+        step_ctx = (
+            step_tracker.next_context(response_ctx)
+            if response_ctx is not None and step_tracker is not None
+            else response_ctx
+        )
+        output_observer = self._profiling_output_observer()
         chat_ctx = chat_ctx.copy()
         tool_ctx = llm.ToolContext(tools)
 
@@ -1561,6 +1746,8 @@ class AgentActivity(RecognitionHooks):
             chat_ctx=chat_ctx,
             tool_ctx=tool_ctx,
             model_settings=model_settings,
+            runtime=runtime,
+            trace_ctx=step_ctx,
         )
         tasks.append(llm_task)
 
@@ -1575,6 +1762,8 @@ class AgentActivity(RecognitionHooks):
                 node=self._agent.tts_node,
                 input=tts_text_input,
                 model_settings=model_settings,
+                runtime=runtime,
+                trace_ctx=step_ctx,
             )
             tasks.append(tts_task)
             if (
@@ -1631,7 +1820,9 @@ class AgentActivity(RecognitionHooks):
             assert tts_gen_data is not None
             # TODO(theomonnom): should the audio be added to the chat_context too?
             forward_task, audio_out = perform_audio_forwarding(
-                audio_output=audio_output, tts_output=tts_gen_data.audio_ch
+                audio_output=audio_output,
+                tts_output=tts_gen_data.audio_ch,
+                observer=output_observer,
             )
             tasks.append(forward_task)
 

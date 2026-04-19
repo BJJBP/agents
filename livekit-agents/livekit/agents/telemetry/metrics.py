@@ -21,9 +21,10 @@ CHILD_PROC_GAUGE = prometheus_client.Gauge(
 )
 
 
-CHILD_PROC_GAUGE.labels(nodename=utils.nodename()).set_function(
-    lambda: len(psutil.Process(os.getpid()).children(recursive=True))
-)
+if not os.getenv("PROMETHEUS_MULTIPROC_DIR"):
+    CHILD_PROC_GAUGE.labels(nodename=utils.nodename()).set_function(
+        lambda: len(psutil.Process(os.getpid()).children(recursive=True))
+    )
 
 
 def job_started() -> None:

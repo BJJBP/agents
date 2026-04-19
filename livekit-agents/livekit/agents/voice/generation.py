@@ -14,6 +14,11 @@ from pydantic import ValidationError
 from livekit import rtc
 
 from .. import llm, utils
+from ..profiling.chunk import ProfilingAudioChunk
+from ..profiling.clock import now_mono_ns, now_wall_time_ns
+from ..profiling.context import TraceContext, current_trace_context, use_trace_context
+from ..profiling.ids import ProfilingIdGenerator
+from ..profiling.tts_adapter import TTSChunkAdapter
 from ..llm import (
     ChatChunk,
     ChatContext,
@@ -51,6 +56,7 @@ class _LLMGenerationData:
     generated_functions: list[llm.FunctionCall] = field(default_factory=list)
     id: str = field(default_factory=lambda: utils.shortuuid("item_"))
     started_fut: asyncio.Future[None] = field(default_factory=asyncio.Future)
+    request_id: str | None = None
 
 
 def perform_llm_inference(
@@ -59,12 +65,22 @@ def perform_llm_inference(
     chat_ctx: ChatContext,
     tool_ctx: ToolContext,
     model_settings: ModelSettings,
+    runtime: Any | None = None,
+    trace_ctx: TraceContext | None = None,
 ) -> tuple[asyncio.Task[bool], _LLMGenerationData]:
     text_ch = aio.Chan[str]()
     function_ch = aio.Chan[llm.FunctionCall]()
     data = _LLMGenerationData(text_ch=text_ch, function_ch=function_ch)
     llm_task = asyncio.create_task(
-        _llm_inference_task(node, chat_ctx, tool_ctx, model_settings, data)
+        _llm_inference_task(
+            node,
+            chat_ctx,
+            tool_ctx,
+            model_settings,
+            data,
+            runtime=runtime,
+            trace_ctx=trace_ctx,
+        )
     )
     llm_task.add_done_callback(lambda _: text_ch.close())
     llm_task.add_done_callback(lambda _: function_ch.close())
@@ -86,9 +102,29 @@ async def _llm_inference_task(
     tool_ctx: ToolContext,
     model_settings: ModelSettings,
     data: _LLMGenerationData,
+    *,
+    runtime: Any | None = None,
+    trace_ctx: TraceContext | None = None,
 ) -> bool:
     current_span = trace.get_current_span()
     data.started_fut.set_result(None)
+    llm_ctx = trace_ctx
+    if llm_ctx is not None:
+        llm_request_id = ":".join(
+            [
+                llm_ctx.trace_id or "trace",
+                llm_ctx.response_id or "response",
+                llm_ctx.attempt_id or "attempt",
+                llm_ctx.generation_step_id or "generation_step",
+                ProfilingIdGenerator.request_id(),
+            ]
+        )
+        llm_ctx = llm_ctx.with_updates(request_id=llm_request_id)
+        data.request_id = llm_ctx.request_id
+    start_mono_ns = now_mono_ns()
+    start_wall_time_ns = now_wall_time_ns()
+    if runtime is not None and llm_ctx is not None:
+        runtime.emit_event("llm_request_started", trace_ctx=llm_ctx)
 
     text_ch, function_ch = data.text_ch, data.function_ch
     tools = list(tool_ctx.function_tools.values())
@@ -103,9 +139,10 @@ async def _llm_inference_task(
         trace_types.ATTR_FUNCTION_TOOLS, json.dumps(list(tool_ctx.function_tools.keys()))
     )
 
-    llm_node = node(chat_ctx, tools, model_settings)
-    if asyncio.iscoroutine(llm_node):
-        llm_node = await llm_node
+    with use_trace_context(llm_ctx):
+        llm_node = node(chat_ctx, tools, model_settings)
+        if asyncio.iscoroutine(llm_node):
+            llm_node = await llm_node
 
     # update the tool context after llm node
     tool_ctx.update_tools(tools)
@@ -120,41 +157,117 @@ async def _llm_inference_task(
         return False
 
     # forward llm stream to output channels
+    saw_first_text_delta = False
+    first_text_delta_mono_ns: int | None = None
+    first_text_delta_wall_time_ns: int | None = None
     try:
-        async for chunk in llm_node:
-            # io.LLMNode can either return a string or a ChatChunk
-            if isinstance(chunk, str):
-                data.generated_text += chunk
-                text_ch.send_nowait(chunk)
+        with use_trace_context(llm_ctx):
+            async for chunk in llm_node:
+                # io.LLMNode can either return a string or a ChatChunk
+                if isinstance(chunk, str):
+                    data.generated_text += chunk
+                    text_ch.send_nowait(chunk)
+                    if not saw_first_text_delta and chunk:
+                        saw_first_text_delta = True
+                        first_text_delta_mono_ns = now_mono_ns()
+                        first_text_delta_wall_time_ns = now_wall_time_ns()
+                        if runtime is not None and llm_ctx is not None:
+                            runtime.emit_event(
+                                "llm_first_text_delta",
+                                trace_ctx=llm_ctx,
+                                mono_ns=first_text_delta_mono_ns,
+                                wall_time_ns=first_text_delta_wall_time_ns,
+                            )
+                            runtime.emit_logical_span(
+                                "llm_ttft",
+                                start_mono_ns=start_mono_ns,
+                                end_mono_ns=first_text_delta_mono_ns,
+                                start_wall_time_ns=start_wall_time_ns,
+                                end_wall_time_ns=first_text_delta_wall_time_ns,
+                                trace_ctx=llm_ctx,
+                                attrs={"request_id": llm_ctx.request_id},
+                            )
 
-            elif isinstance(chunk, ChatChunk):
-                if not chunk.delta:
-                    continue
+                elif isinstance(chunk, ChatChunk):
+                    if not chunk.delta:
+                        continue
 
-                if chunk.delta.tool_calls:
-                    for tool in chunk.delta.tool_calls:
-                        if tool.type != "function":
-                            continue
+                    if chunk.delta.tool_calls:
+                        for tool in chunk.delta.tool_calls:
+                            if tool.type != "function":
+                                continue
 
-                        fnc_call = llm.FunctionCall(
-                            id=f"{data.id}/fnc_{len(data.generated_functions)}",
-                            call_id=tool.call_id,
-                            name=tool.name,
-                            arguments=tool.arguments,
-                        )
-                        data.generated_functions.append(fnc_call)
-                        function_ch.send_nowait(fnc_call)
+                            fnc_call = llm.FunctionCall(
+                                id=f"{data.id}/fnc_{len(data.generated_functions)}",
+                                call_id=tool.call_id,
+                                name=tool.name,
+                                arguments=tool.arguments,
+                            )
+                            data.generated_functions.append(fnc_call)
+                            function_ch.send_nowait(fnc_call)
 
-                if chunk.delta.content:
-                    data.generated_text += chunk.delta.content
-                    text_ch.send_nowait(chunk.delta.content)
-            else:
-                logger.warning(
-                    f"LLM node returned an unexpected type: {type(chunk)}",
-                )
+                    if chunk.delta.content:
+                        data.generated_text += chunk.delta.content
+                        text_ch.send_nowait(chunk.delta.content)
+                        if not saw_first_text_delta:
+                            saw_first_text_delta = True
+                            first_text_delta_mono_ns = now_mono_ns()
+                            first_text_delta_wall_time_ns = now_wall_time_ns()
+                            if runtime is not None and llm_ctx is not None:
+                                runtime.emit_event(
+                                    "llm_first_text_delta",
+                                    trace_ctx=llm_ctx,
+                                    mono_ns=first_text_delta_mono_ns,
+                                    wall_time_ns=first_text_delta_wall_time_ns,
+                                )
+                                runtime.emit_logical_span(
+                                    "llm_ttft",
+                                    start_mono_ns=start_mono_ns,
+                                    end_mono_ns=first_text_delta_mono_ns,
+                                    start_wall_time_ns=start_wall_time_ns,
+                                    end_wall_time_ns=first_text_delta_wall_time_ns,
+                                    trace_ctx=llm_ctx,
+                                    attrs={"request_id": llm_ctx.request_id},
+                                )
+                else:
+                    logger.warning(
+                        f"LLM node returned an unexpected type: {type(chunk)}",
+                    )
     finally:
         if isinstance(llm_node, _ACloseable):
             await llm_node.aclose()
+        if runtime is not None and llm_ctx is not None:
+            llm_done_mono_ns = now_mono_ns()
+            llm_done_wall_time_ns = now_wall_time_ns()
+            runtime.emit_event(
+                "llm_generation_done",
+                trace_ctx=llm_ctx,
+                mono_ns=llm_done_mono_ns,
+                wall_time_ns=llm_done_wall_time_ns,
+            )
+            if (
+                saw_first_text_delta
+                and first_text_delta_mono_ns is not None
+                and first_text_delta_wall_time_ns is not None
+            ):
+                runtime.emit_logical_span(
+                    "llm_decode",
+                    start_mono_ns=first_text_delta_mono_ns,
+                    end_mono_ns=llm_done_mono_ns,
+                    start_wall_time_ns=first_text_delta_wall_time_ns,
+                    end_wall_time_ns=llm_done_wall_time_ns,
+                    trace_ctx=llm_ctx,
+                    attrs={"request_id": llm_ctx.request_id},
+                )
+            runtime.emit_logical_span(
+                "llm_generation",
+                start_mono_ns=start_mono_ns,
+                end_mono_ns=llm_done_mono_ns,
+                start_wall_time_ns=start_wall_time_ns,
+                end_wall_time_ns=llm_done_wall_time_ns,
+                trace_ctx=llm_ctx,
+                attrs={"request_id": llm_ctx.request_id},
+            )
 
     current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, data.generated_text)
     current_span.set_attribute(
@@ -168,18 +281,32 @@ async def _llm_inference_task(
 
 @dataclass
 class _TTSGenerationData:
-    audio_ch: aio.Chan[rtc.AudioFrame]
+    audio_ch: aio.Chan[ProfilingAudioChunk]
     timed_texts_fut: asyncio.Future[aio.Chan[io.TimedString] | None]
 
 
 def perform_tts_inference(
-    *, node: io.TTSNode, input: AsyncIterable[str], model_settings: ModelSettings
+    *,
+    node: io.TTSNode,
+    input: AsyncIterable[str],
+    model_settings: ModelSettings,
+    runtime: Any | None = None,
+    trace_ctx: TraceContext | None = None,
 ) -> tuple[asyncio.Task[bool], _TTSGenerationData]:
-    audio_ch = aio.Chan[rtc.AudioFrame]()
+    audio_ch = aio.Chan[ProfilingAudioChunk]()
     timed_texts_fut = asyncio.Future[Optional[aio.Chan[io.TimedString]]]()
     data = _TTSGenerationData(audio_ch=audio_ch, timed_texts_fut=timed_texts_fut)
 
-    tts_task = asyncio.create_task(_tts_inference_task(node, input, model_settings, data))
+    tts_task = asyncio.create_task(
+        _tts_inference_task(
+            node,
+            input,
+            model_settings,
+            data,
+            runtime=runtime,
+            trace_ctx=trace_ctx,
+        )
+    )
 
     def _inference_done(_: asyncio.Task[bool]) -> None:
         if timed_texts_fut.done() and (timed_text_ch := timed_texts_fut.result()):
@@ -199,21 +326,73 @@ async def _tts_inference_task(
     input: AsyncIterable[str],
     model_settings: ModelSettings,
     data: _TTSGenerationData,
+    *,
+    runtime: Any | None = None,
+    trace_ctx: TraceContext | None = None,
 ) -> bool:
     audio_ch, timed_texts_fut = data.audio_ch, data.timed_texts_fut
-    tts_node = node(input, model_settings)
-    if asyncio.iscoroutine(tts_node):
-        tts_node = await tts_node
+    start_mono_ns = now_mono_ns()
+    start_wall_time_ns = now_wall_time_ns()
+    with use_trace_context(trace_ctx):
+        tts_node = node(input, model_settings)
+        if asyncio.iscoroutine(tts_node):
+            tts_node = await tts_node
 
     if isinstance(tts_node, AsyncIterable):
         timed_text_ch = aio.Chan[io.TimedString]()
         timed_texts_fut.set_result(timed_text_ch)
+        adapter = TTSChunkAdapter(
+            trace_ctx=trace_ctx or current_trace_context() or TraceContext(run_id="unknown")
+        )
+        saw_first_audio = False
+        with use_trace_context(trace_ctx):
+            async for chunk in adapter.adapt(tts_node):
+                for text in chunk.timed_texts:
+                    timed_text_ch.send_nowait(text)
 
-        async for audio_frame in tts_node:
-            for text in audio_frame.userdata.get(USERDATA_TIMED_TRANSCRIPT, []):
-                timed_text_ch.send_nowait(text)
+                if runtime is not None:
+                    if not saw_first_audio:
+                        saw_first_audio = True
+                        first_tts_audio_wall_time_ns = now_wall_time_ns()
+                        runtime.emit_event(
+                            "first_tts_audio",
+                            trace_ctx=chunk.trace_ctx,
+                            mono_ns=chunk.audio_ready_ns,
+                            wall_time_ns=first_tts_audio_wall_time_ns,
+                        )
+                        runtime.emit_logical_span(
+                            "first_tts_audio",
+                            start_mono_ns=start_mono_ns,
+                            end_mono_ns=chunk.audio_ready_ns,
+                            start_wall_time_ns=start_wall_time_ns,
+                            end_wall_time_ns=first_tts_audio_wall_time_ns,
+                            trace_ctx=chunk.trace_ctx,
+                        )
+                    runtime.emit_event(
+                        "tts_chunk_audio_ready",
+                        trace_ctx=chunk.trace_ctx,
+                        mono_ns=chunk.audio_ready_ns,
+                        wall_time_ns=now_wall_time_ns(),
+                        attrs={"chunk_id": chunk.chunk_id, "chunk_idx": chunk.chunk_idx},
+                    )
+                    runtime.emit_event(
+                        "audio_chunk_ready",
+                        trace_ctx=chunk.trace_ctx,
+                        mono_ns=chunk.audio_ready_ns,
+                        wall_time_ns=now_wall_time_ns(),
+                        attrs={"chunk_id": chunk.chunk_id, "chunk_idx": chunk.chunk_idx},
+                    )
+                audio_ch.send_nowait(chunk)
 
-            audio_ch.send_nowait(audio_frame)
+        if runtime is not None and trace_ctx is not None:
+            runtime.emit_logical_span(
+                "tts_generation",
+                start_mono_ns=start_mono_ns,
+                end_mono_ns=now_mono_ns(),
+                start_wall_time_ns=start_wall_time_ns,
+                end_wall_time_ns=now_wall_time_ns(),
+                trace_ctx=trace_ctx,
+            )
         return True
 
     timed_texts_fut.set_result(None)
@@ -258,54 +437,88 @@ async def _text_forwarding_task(
 
 @dataclass
 class _AudioOutput:
-    audio: list[rtc.AudioFrame]
+    audio: list[ProfilingAudioChunk]
     first_frame_fut: asyncio.Future[None]
 
 
 def perform_audio_forwarding(
     *,
     audio_output: io.AudioOutput,
-    tts_output: AsyncIterable[rtc.AudioFrame],
+    tts_output: AsyncIterable[Any],
+    observer: Any | None = None,
 ) -> tuple[asyncio.Task[None], _AudioOutput]:
     out = _AudioOutput(audio=[], first_frame_fut=asyncio.Future())
-    task = asyncio.create_task(_audio_forwarding_task(audio_output, tts_output, out))
+    task = asyncio.create_task(
+        _audio_forwarding_task(audio_output, tts_output, out, observer)
+    )
     return task, out
 
 
 @utils.log_exceptions(logger=logger)
 async def _audio_forwarding_task(
     audio_output: io.AudioOutput,
-    tts_output: AsyncIterable[rtc.AudioFrame],
+    tts_output: AsyncIterable[Any],
     out: _AudioOutput,
+    observer: Any | None = None,
 ) -> None:
     resampler: rtc.AudioResampler | None = None
     try:
         audio_output.resume()
-        async for frame in tts_output:
-            out.audio.append(frame)
+        async for item in tts_output:
+            chunk = (
+                item
+                if isinstance(item, ProfilingAudioChunk)
+                else ProfilingAudioChunk(
+                    chunk_id=ProfilingIdGenerator.chunk_id(),
+                    chunk_idx=0,
+                    trace_ctx=current_trace_context() or TraceContext(run_id="unknown"),
+                    frames=[item],
+                    audio_ready_ns=now_mono_ns(),
+                )
+            )
+            out.audio.append(chunk)
+            pushed_frames: list[rtc.AudioFrame] = []
 
             if (
                 not out.first_frame_fut.done()
                 and audio_output.sample_rate is not None
-                and frame.sample_rate != audio_output.sample_rate
+                and chunk.frames
+                and chunk.frames[0].sample_rate != audio_output.sample_rate
                 and resampler is None
             ):
                 resampler = rtc.AudioResampler(
-                    input_rate=frame.sample_rate,
+                    input_rate=chunk.frames[0].sample_rate,
                     output_rate=audio_output.sample_rate,
-                    num_channels=frame.num_channels,
+                    num_channels=chunk.frames[0].num_channels,
                 )
 
-            if resampler:
-                for f in resampler.push(frame):
-                    await audio_output.capture_frame(f)
-            else:
-                await audio_output.capture_frame(frame)
+            for frame in chunk.frames:
+                if resampler:
+                    for f in resampler.push(frame):
+                        pushed_frames.append(f)
+                        await audio_output.capture_frame(f)
+                else:
+                    pushed_frames.append(frame)
+                    await audio_output.capture_frame(frame)
 
             # set the first frame future if not already set
             # (after completing the first frame)
             if not out.first_frame_fut.done():
                 out.first_frame_fut.set_result(None)
+
+            if observer is not None:
+                if pushed_frames != chunk.frames:
+                    chunk = ProfilingAudioChunk(
+                        chunk_id=chunk.chunk_id,
+                        chunk_idx=chunk.chunk_idx,
+                        trace_ctx=chunk.trace_ctx,
+                        frames=pushed_frames,
+                        audio_ready_ns=chunk.audio_ready_ns,
+                        timed_texts=chunk.timed_texts,
+                        task_id=chunk.task_id,
+                        attrs=chunk.attrs,
+                    )
+                observer.push_chunk(chunk)
 
         if resampler:
             for frame in resampler.flush():

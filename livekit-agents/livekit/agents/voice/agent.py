@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar
 from livekit import rtc
 
 from .. import llm, stt, tokenize, tts, utils, vad
+from ..profiling.tts_adapter import TTS_FRAME_METADATA
 from ..llm import (
     ChatContext,
     FunctionTool,
@@ -343,6 +344,26 @@ class Agent:
 
                 wrapped_stt = stt.StreamAdapter(stt=wrapped_stt, vad=activity.vad)
 
+            try:
+                userdata = activity.session.userdata
+            except ValueError:
+                userdata = None
+            if isinstance(userdata, dict):
+                runtime = userdata.get("profiling_runtime")
+                turn_tracker = userdata.get("profiling_turn_tracker")
+
+                def _trace_provider():
+                    if turn_tracker is None:
+                        return None
+                    current_ctx = getattr(turn_tracker, "current_context", None)
+                    return current_ctx or turn_tracker.ensure_turn_started()
+
+                setattr(wrapped_stt, "_fireredchat_runtime", runtime)
+                setattr(wrapped_stt, "_fireredchat_trace_provider", _trace_provider)
+                if hasattr(wrapped_stt, "_stt"):
+                    setattr(wrapped_stt._stt, "_fireredchat_runtime", runtime)
+                    setattr(wrapped_stt._stt, "_fireredchat_trace_provider", _trace_provider)
+
             conn_options = activity.session.conn_options.stt_conn_options
             async with wrapped_stt.stream(conn_options=conn_options) as stream:
 
@@ -399,6 +420,19 @@ class Agent:
                     # sentence_tokenizer=tokenize.blingfire.SentenceTokenizer(retain_format=True),
                 )
 
+            try:
+                userdata = activity.session.userdata
+            except ValueError:
+                userdata = None
+            if isinstance(userdata, dict):
+                scheduler_client = userdata.get("profiling_tts_scheduler_client")
+                runtime = userdata.get("profiling_runtime")
+                setattr(wrapped_tts, "_fireredchat_scheduler_client", scheduler_client)
+                setattr(wrapped_tts, "_fireredchat_runtime", runtime)
+                if hasattr(wrapped_tts, "_wrapped_tts"):
+                    setattr(wrapped_tts._wrapped_tts, "_fireredchat_scheduler_client", scheduler_client)
+                    setattr(wrapped_tts._wrapped_tts, "_fireredchat_runtime", runtime)
+
             conn_options = activity.session.conn_options.tts_conn_options
             async with wrapped_tts.stream(conn_options=conn_options) as stream:
 
@@ -411,6 +445,11 @@ class Agent:
                 forward_task = asyncio.create_task(_forward_input())
                 try:
                     async for ev in stream:
+                        ev.frame.userdata[TTS_FRAME_METADATA] = {
+                            "request_id": ev.request_id,
+                            "segment_id": ev.segment_id,
+                            "is_final": ev.is_final,
+                        }
                         yield ev.frame
                 finally:
                     await utils.aio.cancel_and_wait(forward_task)

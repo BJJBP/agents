@@ -5,6 +5,9 @@ from collections.abc import AsyncIterable
 from typing import Any
 
 from .. import utils
+from ..profiling.clock import now_mono_ns, now_wall_time_ns
+from ..profiling.ids import ProfilingIdGenerator
+from ..profiling.context import use_trace_context
 from ..types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, APIConnectOptions, NotGivenOr
 from ..vad import VAD, VADEvent, VADEventType
 from .stt import STT, RecognizeStream, SpeechEvent, SpeechEventType, STTCapabilities
@@ -109,11 +112,53 @@ class StreamAdapterWrapper(RecognizeStream):
                     )
 
                     merged_frames = utils.merge_frames(event.frames)
-                    t_event = await self._wrapped_stt.recognize(
-                        buffer=merged_frames,
-                        language=self._language,
-                        conn_options=self._wrapped_stt_conn_options,
+                    runtime = getattr(
+                        self._wrapped_stt,
+                        "_fireredchat_runtime",
+                        getattr(self._stt, "_fireredchat_runtime", None),
                     )
+                    trace_provider = getattr(
+                        self._wrapped_stt,
+                        "_fireredchat_trace_provider",
+                        getattr(self._stt, "_fireredchat_trace_provider", None),
+                    )
+                    trace_ctx = trace_provider() if callable(trace_provider) else None
+                    if trace_ctx is not None:
+                        trace_ctx = trace_ctx.with_updates(
+                            request_id=":".join(
+                                [
+                                    trace_ctx.trace_id or "trace",
+                                    trace_ctx.turn_id or "turn",
+                                    "asr",
+                                    ProfilingIdGenerator.request_id(),
+                                ]
+                            )
+                        )
+                    recognize_start_mono_ns = now_mono_ns()
+                    recognize_start_wall_time_ns = now_wall_time_ns()
+                    if runtime is not None and trace_ctx is not None:
+                        runtime.emit_event(
+                            "asr_task_enqueued",
+                            trace_ctx=trace_ctx,
+                            mono_ns=recognize_start_mono_ns,
+                            wall_time_ns=recognize_start_wall_time_ns,
+                        )
+                    with use_trace_context(trace_ctx):
+                        t_event = await self._wrapped_stt.recognize(
+                            buffer=merged_frames,
+                            language=self._language,
+                            conn_options=self._wrapped_stt_conn_options,
+                        )
+                    if runtime is not None and trace_ctx is not None:
+                        runtime.emit_logical_span(
+                            "asr_wall",
+                            start_mono_ns=recognize_start_mono_ns,
+                            end_mono_ns=now_mono_ns(),
+                            start_wall_time_ns=recognize_start_wall_time_ns,
+                            end_wall_time_ns=now_wall_time_ns(),
+                            trace_ctx=trace_ctx,
+                            attrs={"request_id": trace_ctx.request_id},
+                        )
 
                     if len(t_event.alternatives) == 0:
                         continue
@@ -123,6 +168,7 @@ class StreamAdapterWrapper(RecognizeStream):
                     self._event_ch.send_nowait(
                         SpeechEvent(
                             type=SpeechEventType.FINAL_TRANSCRIPT,
+                            request_id=t_event.request_id,
                             alternatives=[t_event.alternatives[0]],
                         )
                     )

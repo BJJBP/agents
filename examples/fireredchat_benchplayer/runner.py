@@ -6,13 +6,17 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
+from livekit.agents.profiling import StandaloneMetricsServer
 from livekit.agents.inference_runner import _InferenceRunner
 from livekit.agents.ipc.inference_proc_executor import InferenceProcExecutor
 
 from fireredchat_app import (
     attach_session_text_logging,
     build_agent,
+    build_profiling_config,
+    build_profiling_userdata,
     build_session,
+    close_profiling_userdata,
     load_vad,
     write_session_transcript,
 )
@@ -44,9 +48,17 @@ async def run_bench(config: BenchConfig) -> None:
     logger = get_bench_logger(config.runtime_log_dir)
     run_id = _build_run_id()
     inference_executor = await _create_inference_executor()
+    metrics_server: StandaloneMetricsServer | None = None
     worker_count = min(config.concurrent_sessions, len(cases))
 
     try:
+        if config.profiling_enabled:
+            metrics_server = StandaloneMetricsServer(
+                host="127.0.0.1",
+                port=config.bench_metrics_port,
+            )
+            await metrics_server.start()
+
         log_run_started(
             logger,
             run_id=run_id,
@@ -86,6 +98,8 @@ async def run_bench(config: BenchConfig) -> None:
             failed_cases=failed_cases,
         )
     finally:
+        if metrics_server is not None:
+            await metrics_server.aclose()
         await inference_executor.aclose()
 
 
@@ -138,9 +152,19 @@ async def _run_case(
         # pVAD keeps mutable inference buffers on the model instance, so each case needs
         # its own VAD object to avoid cross-session state bleed in concurrent bench runs.
         vad = await asyncio.to_thread(load_vad)
+        profiling_userdata = build_profiling_userdata(
+            build_profiling_config(
+                run_id=run_id,
+                session_id=session_id,
+                enabled=config.profiling_enabled,
+                log_root=config.profiling_log_root,
+                scheduler_endpoint=config.scheduler_endpoint,
+            )
+        )
         session = build_session(
             vad,
             userdata={
+                **profiling_userdata,
                 "run_id": run_id,
                 "session_id": session_id,
                 "wav_path": str(case.wav_path),
@@ -213,6 +237,8 @@ async def _run_case(
         if session is not None or audio_input is not None or audio_output is not None:
             try:
                 await _close_case(audio_input=audio_input, audio_output=audio_output, session=session)
+                if session is not None:
+                    await close_profiling_userdata(session.userdata)
             except Exception as exc:
                 log_session_error(
                     logger,

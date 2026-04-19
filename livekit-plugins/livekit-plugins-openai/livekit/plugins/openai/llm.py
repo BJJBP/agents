@@ -24,6 +24,7 @@ import httpx
 
 import openai
 from livekit.agents import APIConnectionError, APIStatusError, APITimeoutError, llm
+from livekit.agents.profiling.context import current_trace_context
 from livekit.agents.llm import ToolChoice, utils as llm_utils
 from livekit.agents.llm.chat_context import ChatContext
 from livekit.agents.llm.tool_context import FunctionTool, RawFunctionTool
@@ -778,9 +779,21 @@ class LLMStream(llm.LLMStream):
                         "chat_ctx": chat_ctx,
                     },
                 )
+            request_id = None
+            if trace_ctx := current_trace_context():
+                request_id = trace_ctx.request_id
+
+            request_kwargs = dict(self._extra_kwargs)
             if not self._tools:
-                # remove tool_choice from extra_kwargs if no tools are provided
-                self._extra_kwargs.pop("tool_choice", None)
+                # remove tool_choice from extra kwargs if no tools are provided
+                request_kwargs.pop("tool_choice", None)
+            if request_id:
+                extra_body = request_kwargs.pop("extra_body", None)
+                merged_extra_body: dict[str, Any] = {}
+                if isinstance(extra_body, dict):
+                    merged_extra_body.update(extra_body)
+                merged_extra_body["request_id"] = request_id
+                request_kwargs["extra_body"] = merged_extra_body
 
             self._oai_stream = stream = await self._client.chat.completions.create(
                 messages=cast(list[ChatCompletionMessageParam], chat_ctx),
@@ -789,7 +802,7 @@ class LLMStream(llm.LLMStream):
                 stream_options={"include_usage": True},
                 stream=True,
                 timeout=httpx.Timeout(self._conn_options.timeout),
-                **self._extra_kwargs,
+                **request_kwargs,
             )
 
             thinking = asyncio.Event()

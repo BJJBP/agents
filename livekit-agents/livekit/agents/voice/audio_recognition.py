@@ -12,6 +12,7 @@ from opentelemetry import trace
 from livekit import rtc
 
 from .. import llm, stt, utils, vad
+from ..profiling.clock import now_mono_ns, now_wall_time_ns
 from ..log import logger
 from ..telemetry import trace_types, tracer
 from ..types import NOT_GIVEN, NotGivenOr
@@ -125,12 +126,12 @@ class AudioRecognition:
         self.update_stt(None)
         # self.update_vad(None)
 
-    def push_audio(self, frame: rtc.AudioFrame) -> None:
+    def push_audio(self, frame: rtc.AudioFrame, *, source: str = "raw_user_audio") -> None:
         self._sample_rate = frame.sample_rate
         if self._stt_ch is not None:
             self._stt_ch.send_nowait(frame)
 
-        if self._vad_ch is not None:
+        if source == "raw_user_audio" and self._vad_ch is not None:
             self._vad_ch.send_nowait(frame)
 
     async def aclose(self) -> None:
@@ -204,7 +205,7 @@ class AudioRecognition:
                         samples_per_channel=num_samples,
                     )
                     for _ in range(5):  # 5 * 0.2s = 1s
-                        self.push_audio(silence_frame)
+                        self.push_audio(silence_frame, source="synthetic_silence")
 
                 # wait for the final transcript to be available
                 try:
@@ -246,6 +247,22 @@ class AudioRecognition:
             await self._on_stt_event(ev)
 
     async def _on_stt_event(self, ev: stt.SpeechEvent) -> None:
+        runtime_getter = getattr(self._hooks, "_profiling_runtime", None)
+        runtime = runtime_getter() if callable(runtime_getter) else None
+        turn_tracker_getter = getattr(self._hooks, "_profiling_turn_tracker", None)
+        turn_tracker = turn_tracker_getter() if callable(turn_tracker_getter) else None
+        trace_ctx = turn_tracker.current_context if turn_tracker is not None else None
+        event_trace_ctx = trace_ctx
+        if turn_tracker is not None and ev.request_id:
+            parts = ev.request_id.split(":")
+            if len(parts) >= 2 and parts[0].startswith("trace_") and parts[1].startswith("turn_"):
+                event_trace_ctx = turn_tracker.base_context.with_updates(
+                    trace_id=parts[0],
+                    turn_id=parts[1],
+                    request_id=ev.request_id,
+                )
+            elif trace_ctx is not None:
+                event_trace_ctx = trace_ctx.with_updates(request_id=ev.request_id)
         if (
             self._turn_detection_mode == "manual"
             and self._user_turn_committed
@@ -272,6 +289,16 @@ class AudioRecognition:
             if not transcript:
                 return
 
+            if runtime is not None and event_trace_ctx is not None:
+                runtime.emit_event(
+                    "asr_final_transcript",
+                    trace_ctx=event_trace_ctx,
+                    attrs={
+                        "request_id": ev.request_id,
+                        "transcript": transcript,
+                        "language": language,
+                    },
+                )
             self._hooks.on_final_transcript(ev)
             logger.debug(
                 "received user transcript",
@@ -355,6 +382,12 @@ class AudioRecognition:
             # stt enabled but no transcript yet
             return
 
+        runtime_getter = getattr(self._hooks, "_profiling_runtime", None)
+        runtime = runtime_getter() if callable(runtime_getter) else None
+        turn_tracker_getter = getattr(self._hooks, "_profiling_turn_tracker", None)
+        turn_tracker = turn_tracker_getter() if callable(turn_tracker_getter) else None
+        trace_ctx = turn_tracker.current_context if turn_tracker is not None else None
+
         chat_ctx = chat_ctx.copy()
         chat_ctx.add_message(role="user", content=self._audio_transcript)
         turn_detector = (
@@ -371,6 +404,10 @@ class AudioRecognition:
                 if not await turn_detector.supports_language(self._last_language):
                     logger.info("Turn detector does not support language %s", self._last_language)
                 else:
+                    if runtime is not None and trace_ctx is not None:
+                        runtime.emit_event("turn_detector_started", trace_ctx=trace_ctx)
+                    turn_detection_start_mono_ns = now_mono_ns()
+                    turn_detection_start_wall_time_ns = now_wall_time_ns()
                     with (
                         trace.use_span(user_turn_span),
                         tracer.start_as_current_span("eou_detection") as eou_detection_span,
@@ -393,6 +430,23 @@ class AudioRecognition:
                         except Exception:
                             logger.exception("Error predicting end of turn")
 
+                        if runtime is not None and trace_ctx is not None:
+                            runtime.emit_event(
+                                "turn_detector_result",
+                                trace_ctx=trace_ctx,
+                                attrs={
+                                    "end_of_turn_probability": end_of_turn_probability,
+                                    "endpointing_delay": endpointing_delay,
+                                },
+                            )
+                            runtime.emit_logical_span(
+                                "turn_detection_wall",
+                                start_mono_ns=turn_detection_start_mono_ns,
+                                end_mono_ns=now_mono_ns(),
+                                start_wall_time_ns=turn_detection_start_wall_time_ns,
+                                end_wall_time_ns=now_wall_time_ns(),
+                                trace_ctx=trace_ctx,
+                            )
                         eou_detection_span.set_attributes(
                             {
                                 trace_types.ATTR_CHAT_CTX: json.dumps(

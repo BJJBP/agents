@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -10,6 +12,14 @@ from typing import Any
 import httpx
 import openai as openai_sdk
 from livekit.agents import Agent, AgentSession
+from livekit.agents.profiling import (
+    GenerationStepTracker,
+    ProfilingIdGenerator,
+    ProfilingRuntime,
+    SharedTTSAdmissionClient,
+    TurnTracker,
+    UnifiedOutputObserver,
+)
 from livekit.agents.llm import ChatContext
 from livekit.agents.voice.events import ConversationItemAddedEvent, UserInputTranscribedEvent
 from livekit.plugins import firered, fireredchat_pvad, openai
@@ -20,6 +30,7 @@ logger = logging.getLogger("red-agent")
 DEFAULT_AGENT_NAME = "youyou"
 DEFAULT_TTS_VOICE = "f531"
 TRANSCRIPT_ROOT = Path("/NAS/projects/FireRedChat/logs")
+DEFAULT_PROFILING_ROOT = Path("/NAS/projects/FireRedChat/logs/profiling")
 
 CHARACTERS = {
     "nana": "简介: 你是娜娜，一名初出茅庐的塔罗占卜师兼恋爱分析师。"
@@ -48,6 +59,108 @@ class MyAgent(Agent):
 
     async def on_enter(self) -> None:
         self.session.generate_reply()
+
+
+@dataclass(slots=True)
+class ProfilingConfig:
+    enabled: bool
+    log_root: Path
+    run_id: str
+    session_id: str
+    worker_id: str | None
+    job_id: str | None
+    prometheus_port: int | None
+    scheduler_endpoint: str | None
+
+
+def build_profiling_config(
+    *,
+    run_id: str | None = None,
+    session_id: str | None = None,
+    worker_id: str | None = None,
+    job_id: str | None = None,
+    prometheus_port: int | None = None,
+    enabled: bool | None = None,
+    log_root: Path | None = None,
+    scheduler_endpoint: str | None = None,
+) -> ProfilingConfig:
+    profiling_enabled = (
+        enabled if enabled is not None else os.getenv("FIREREDCHAT_PROFILING_ENABLED", "1") != "0"
+    )
+    raw_port = os.getenv("FIREREDCHAT_PROMETHEUS_PORT")
+    return ProfilingConfig(
+        enabled=profiling_enabled,
+        log_root=(
+            log_root
+            or Path(
+                os.getenv("FIREREDCHAT_PROFILING_LOG_ROOT", str(DEFAULT_PROFILING_ROOT))
+            ).expanduser()
+        ),
+        run_id=run_id or os.getenv("FIREREDCHAT_RUN_ID") or ProfilingIdGenerator.run_id(),
+        session_id=session_id or ProfilingIdGenerator.session_id(),
+        worker_id=worker_id or os.getenv("FIREREDCHAT_WORKER_ID"),
+        job_id=job_id or os.getenv("FIREREDCHAT_JOB_ID"),
+        prometheus_port=(
+            prometheus_port if prometheus_port is not None else int(raw_port) if raw_port else None
+        ),
+        scheduler_endpoint=scheduler_endpoint or os.getenv("FIREREDCHAT_TTS_SCHEDULER_ENDPOINT"),
+    )
+
+
+def build_profiling_userdata(config: ProfilingConfig) -> dict[str, Any]:
+    userdata: dict[str, Any] = {
+        "run_id": config.run_id,
+        "session_id": config.session_id,
+        "profiling_enabled": config.enabled,
+    }
+    if not config.enabled:
+        return userdata
+
+    runtime = ProfilingRuntime(
+        component="worker",
+        log_root=config.log_root,
+        run_id=config.run_id,
+        worker_id=config.worker_id,
+        job_id=config.job_id,
+        session_id=config.session_id,
+        extra_file_tag=config.session_id,
+    )
+    runtime.write_clock_anchor()
+    base_context = runtime.base_trace_context()
+    turn_tracker = TurnTracker(runtime=runtime, base_context=base_context)
+    userdata.update(
+        {
+            "profiling_runtime": runtime,
+            "profiling_turn_tracker": turn_tracker,
+            "profiling_generation_step_tracker": GenerationStepTracker(runtime=runtime),
+            "profiling_output_observer": UnifiedOutputObserver(
+                runtime=runtime,
+                turn_tracker=turn_tracker,
+            ),
+            "profiling_tts_scheduler_client": SharedTTSAdmissionClient(config.scheduler_endpoint),
+            "profiling_base_context": base_context,
+            "profiling_log_root": str(config.log_root),
+        }
+    )
+    return userdata
+
+
+async def close_profiling_userdata(userdata: Any) -> None:
+    if not isinstance(userdata, dict):
+        return
+
+    output_observer = userdata.get("profiling_output_observer")
+    if output_observer is not None:
+        output_observer.close()
+
+    scheduler_client = userdata.get("profiling_tts_scheduler_client")
+    if scheduler_client is not None:
+        await scheduler_client.aclose()
+
+    runtime = userdata.get("profiling_runtime")
+    if runtime is not None:
+        runtime.flush()
+        runtime.close()
 
 
 def load_vad() -> Any:
